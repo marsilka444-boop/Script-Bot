@@ -1,0 +1,751 @@
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local CONFIG = {
+	StopDistance = 2.5,
+	AutoAttack = true,
+	AttackRange = 9,
+	AttackCooldown = 0.15,
+	TargetMoveThreshold = 6,
+	WaypointTimeout = 2.5,
+	StuckTime = 0.8,
+	StuckDistance = 0.6,
+	WaypointSpacing = 3,
+	MaxFollowTime = 8,
+	RepathCooldown = 1.5,
+}
+
+local AGENTS = {
+	{ AgentRadius = 2, AgentHeight = 5 },
+	{ AgentRadius = 1.2, AgentHeight = 5 },
+	{ AgentRadius = 0.8, AgentHeight = 3.5 },
+}
+
+local Bot = {
+	Running = false,
+	Target = nil,
+	Token = 0,
+	Stuck = false,
+	Moving = false,
+	Sword = nil,
+	Visited = {},
+	Steps = 0,
+	LastDir = nil,
+	NextPathTime = 0,
+	WallTime = 0,
+}
+
+local statusCallback = function() end
+local function setStatus(text)
+	statusCallback(text)
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+local function getParts(plr)
+	local char = plr and plr.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if hum and hrp and hum.Health > 0 then
+		return char, hum, hrp
+	end
+end
+
+local function active(token)
+	return Bot.Running and Bot.Token == token
+end
+
+local function groundAt(pos, up, len)
+	return workspace:Raycast(pos + Vector3.new(0, up, 0), Vector3.new(0, -len, 0), rayParams)
+end
+
+local function floorY(pos)
+	local hit = groundAt(pos, 1, 10)
+	return hit and hit.Position.Y or pos.Y - 3
+end
+
+local function hasLineOfSight(from, to)
+	return workspace:Raycast(from, to - from, rayParams) == nil
+end
+
+local function groundOk(from, to)
+	local flat = (to - from) * Vector3.new(1, 0, 1)
+	local dist = flat.Magnitude
+	if dist < 1 then return true end
+	local dir = flat.Unit
+	local prevY = floorY(from)
+	for d = 2, dist, 2 do
+		local hit = groundAt(from + dir * d, 4, 20)
+		if not hit then return false end
+		local y = hit.Position.Y
+		if prevY - y > 6 or y - prevY > 3.5 then return false end
+		prevY = y
+	end
+	return true
+end
+
+local function dirClear(pos, dir, fy)
+	local low = workspace:Raycast(pos - Vector3.new(0, 2, 0), dir * 4, rayParams)
+	local high = workspace:Raycast(pos + Vector3.new(0, 1.5, 0), dir * 4, rayParams)
+	if low and high then return false end
+	for _, d in ipairs({ 3, 6 }) do
+		local hit = groundAt(pos + dir * d, 3, 16)
+		if not hit then return false end
+		if fy - hit.Position.Y > 7 then return false end
+	end
+	return true
+end
+
+local function cellKey(p)
+	return math.floor(p.X / 5) .. "," .. math.floor(p.Y / 8) .. "," .. math.floor(p.Z / 5)
+end
+
+local function steerStep(myHum, myHrp, tHrp)
+	local pos = myHrp.Position
+	local fy = floorY(pos)
+	local toT = (tHrp.Position - pos) * Vector3.new(1, 0, 1)
+	local toDir = toT.Magnitude > 0.1 and toT.Unit or Vector3.zAxis
+
+	Bot.Steps += 1
+	if Bot.Steps > 60 then
+		Bot.Visited = {}
+		Bot.Steps = 0
+	end
+
+	if Bot.Stuck then
+		Bot.Stuck = false
+		if Bot.LastDir then
+			local k = cellKey(pos + Bot.LastDir * 6)
+			Bot.Visited[k] = (Bot.Visited[k] or 0) + 3
+		end
+	end
+
+	local bestDir, bestScore = nil, -math.huge
+	for i = 0, 15 do
+		local a = i / 16 * math.pi * 2
+		local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+		if dirClear(pos, dir, fy) then
+			local score = dir:Dot(toDir) * 2
+			score -= (Bot.Visited[cellKey(pos + dir * 6)] or 0) * 0.7
+			if Bot.LastDir then
+				score += dir:Dot(Bot.LastDir) * 0.6
+			end
+			if score > bestScore then
+				bestScore, bestDir = score, dir
+			end
+		end
+	end
+
+	local key = cellKey(pos)
+	Bot.Visited[key] = (Bot.Visited[key] or 0) + 1
+
+	if bestDir then
+		Bot.LastDir = bestDir
+		myHum:MoveTo(pos + bestDir * 8)
+	else
+		Bot.LastDir = nil
+		myHum.Jump = true
+		myHum:MoveTo(pos - toDir * 6)
+	end
+	task.wait(0.35)
+end
+
+local function snapGoal(tHrp)
+	local hit = groundAt(tHrp.Position, 0, 40)
+	if hit then
+		return hit.Position
+	end
+	return tHrp.Position
+end
+
+local function findPath(myHrp, tHrp, token)
+	local base = snapGoal(tHrp)
+	local goals = { base }
+	for _, o in ipairs({
+		Vector3.new(4, 0, 0),
+		Vector3.new(-4, 0, 0),
+		Vector3.new(0, 0, 4),
+		Vector3.new(0, 0, -4),
+	}) do
+		local hit = groundAt(base + o, 6, 30)
+		if hit then
+			table.insert(goals, hit.Position)
+		end
+	end
+
+	for _, agent in ipairs(AGENTS) do
+		for _, goal in ipairs(goals) do
+			if not active(token) then return end
+			local path = PathfindingService:CreatePath({
+				AgentRadius = agent.AgentRadius,
+				AgentHeight = agent.AgentHeight,
+				AgentCanJump = true,
+				AgentCanClimb = true,
+				WaypointSpacing = CONFIG.WaypointSpacing,
+				Costs = { Water = 20 },
+			})
+			local ok = pcall(function()
+				path:ComputeAsync(myHrp.Position, goal)
+			end)
+			if ok and path.Status == Enum.PathStatus.Success then
+				return path
+			end
+		end
+	end
+end
+
+local function getSword()
+	local char = LocalPlayer.Character
+	if not char then return end
+	local equipped = char:FindFirstChildOfClass("Tool")
+	if equipped then return equipped end
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if backpack then
+		for _, t in ipairs(backpack:GetChildren()) do
+			if t:IsA("Tool") then
+				return t
+			end
+		end
+	end
+end
+
+local function faceTarget(myHrp, tHrp)
+	local look = Vector3.new(tHrp.Position.X, myHrp.Position.Y, tHrp.Position.Z)
+	if (look - myHrp.Position).Magnitude > 0.1 then
+		myHrp.CFrame = CFrame.lookAt(myHrp.Position, look)
+	end
+end
+
+local function attackLoop(token)
+	while active(token) do
+		local _, myHum, myHrp = getParts(LocalPlayer)
+		local _, _, tHrp = getParts(Bot.Target)
+
+		if CONFIG.AutoAttack and myHum and tHrp
+			and (tHrp.Position - myHrp.Position).Magnitude <= CONFIG.AttackRange then
+
+			local sword = Bot.Sword
+			local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+			if not sword or not sword.Parent
+				or (sword.Parent ~= LocalPlayer.Character and sword.Parent ~= backpack) then
+				sword = getSword()
+				Bot.Sword = sword
+			end
+
+			if sword then
+				if sword.Parent ~= LocalPlayer.Character then
+					myHum:EquipTool(sword)
+					task.wait(0.1)
+				end
+				faceTarget(myHrp, tHrp)
+				pcall(function()
+					sword:Activate()
+				end)
+			end
+			task.wait(CONFIG.AttackCooldown)
+		else
+			task.wait(0.1)
+		end
+	end
+end
+
+local lastPos, lastCheck = nil, 0
+RunService.Heartbeat:Connect(function()
+	if not Bot.Running then
+		lastPos = nil
+		return
+	end
+	local _, hum, hrp = getParts(LocalPlayer)
+	if not hum then return end
+
+	local now = os.clock()
+	local dir = hum.MoveDirection
+
+	if Bot.Moving and dir.Magnitude > 0.1 and hum.FloorMaterial ~= Enum.Material.Air then
+		local flatDir = Vector3.new(dir.X, 0, dir.Z).Unit
+
+		local low = workspace:Raycast(hrp.Position - Vector3.new(0, 2, 0), flatDir * 3.5, rayParams)
+		local high = workspace:Raycast(hrp.Position + Vector3.new(0, 1.5, 0), flatDir * 3.5, rayParams)
+		if low and high then
+			if low.Distance < 2.5 and high.Distance < 2.5 and now - Bot.WallTime > 0.6 then
+				Bot.WallTime = now
+				Bot.Stuck = true
+			end
+		elseif low and not high then
+			hum.Jump = true
+		end
+
+		local fy = floorY(hrp.Position)
+		local near = groundAt(hrp.Position + flatDir * 3, 3, 14)
+		local far = groundAt(hrp.Position + flatDir * 8, 3, 14)
+		local nearVoid = (not near) or (fy - near.Position.Y > 10)
+		if nearVoid then
+			if (not far) or (fy - far.Position.Y > 10) then
+				hum:MoveTo(hrp.Position)
+				Bot.Stuck = true
+			else
+				hum.Jump = true
+			end
+		end
+	end
+
+	if Bot.Moving then
+		if not lastPos then
+			lastPos, lastCheck = hrp.Position, now
+		elseif now - lastCheck >= CONFIG.StuckTime then
+			if (hrp.Position - lastPos).Magnitude < CONFIG.StuckDistance then
+				Bot.Stuck = true
+				hum.Jump = true
+			end
+			lastPos, lastCheck = hrp.Position, now
+		end
+	else
+		lastPos = nil
+	end
+end)
+
+local function follow(path, myHum, myHrp, goalRef, token)
+	local waypoints = path:GetWaypoints()
+	local blocked = false
+	local conn = path.Blocked:Connect(function()
+		blocked = true
+	end)
+	local started = os.clock()
+	local abort = false
+	local i = 2
+
+	while i <= #waypoints and not abort do
+		if not active(token) or os.clock() - started > CONFIG.MaxFollowTime then
+			break
+		end
+		local wp = waypoints[i]
+		if wp.Action == Enum.PathWaypointAction.Jump then
+			myHum.Jump = true
+		end
+		myHum:MoveTo(wp.Position)
+
+		local t0 = os.clock()
+		while os.clock() - t0 < CONFIG.WaypointTimeout do
+			task.wait(0.05)
+			if not active(token) or not myHrp.Parent then
+				abort = true
+				break
+			end
+
+			local _, _, tHrp = getParts(Bot.Target)
+			if not tHrp or (tHrp.Position - goalRef).Magnitude > CONFIG.TargetMoveThreshold then
+				abort = true
+				break
+			end
+
+			if blocked or Bot.Stuck then
+				Bot.Stuck = false
+				abort = true
+				break
+			end
+
+			local flat = (wp.Position - myHrp.Position) * Vector3.new(1, 0, 1)
+			if flat.Magnitude < 2.5 and math.abs(wp.Position.Y - myHrp.Position.Y) < 4 then
+				break
+			end
+		end
+		i += 1
+	end
+
+	conn:Disconnect()
+end
+
+local function runBot(token)
+	while active(token) do
+		local myChar, myHum, myHrp = getParts(LocalPlayer)
+		local tChar, _, tHrp = getParts(Bot.Target)
+
+		if not (myHum and tHrp) then
+			Bot.Moving = false
+			setStatus("Ожидание персонажа...")
+			task.wait(0.5)
+			continue
+		end
+
+		rayParams.FilterDescendantsInstances = { myChar, tChar }
+
+		local dist = (tHrp.Position - myHrp.Position).Magnitude
+		if dist <= CONFIG.StopDistance then
+			Bot.Moving = false
+			myHum:MoveTo(myHrp.Position)
+			faceTarget(myHrp, tHrp)
+			setStatus("Вплотную к цели ✓")
+			task.wait(0.05)
+			continue
+		end
+
+		Bot.Moving = true
+		local heightDiff = math.abs(tHrp.Position.Y - myHrp.Position.Y)
+
+		if heightDiff < 3.5
+			and hasLineOfSight(myHrp.Position, tHrp.Position)
+			and groundOk(myHrp.Position, tHrp.Position)
+		then
+			setStatus("Бегу напрямую...")
+			myHum:MoveTo(tHrp.Position)
+			task.wait(0.05)
+			if Bot.Stuck then
+				Bot.Stuck = false
+				local side = myHrp.CFrame.RightVector * (math.random() < 0.5 and 6 or -6)
+				myHum:MoveTo(myHrp.Position + side)
+				task.wait(0.4)
+			end
+		else
+			if os.clock() >= Bot.NextPathTime then
+				setStatus("Ищу путь...")
+				local path = findPath(myHrp, tHrp, token)
+				if path then
+					Bot.Visited = {}
+					Bot.LastDir = nil
+					setStatus("Иду по маршруту")
+					follow(path, myHum, myHrp, tHrp.Position, token)
+				else
+					Bot.NextPathTime = os.clock() + CONFIG.RepathCooldown
+				end
+			else
+				setStatus("Ищу проход...")
+				steerStep(myHum, myHrp, tHrp)
+			end
+		end
+	end
+
+	Bot.Moving = false
+	local _, hum, hrp = getParts(LocalPlayer)
+	if hum and hrp then
+		hum:MoveTo(hrp.Position)
+	end
+end
+
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local old = playerGui:FindFirstChild("FollowBotGui")
+if old then old:Destroy() end
+
+local COLORS = {
+	bg = Color3.fromRGB(16, 16, 26),
+	panel = Color3.fromRGB(24, 24, 38),
+	row = Color3.fromRGB(34, 34, 52),
+	rowSelected = Color3.fromRGB(70, 55, 140),
+	accentA = Color3.fromRGB(124, 92, 255),
+	accentB = Color3.fromRGB(0, 190, 255),
+	on = Color3.fromRGB(46, 204, 113),
+	off = Color3.fromRGB(231, 76, 60),
+	text = Color3.fromRGB(240, 240, 250),
+	subtext = Color3.fromRGB(150, 150, 175),
+}
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = parent
+	return c
+end
+
+local function stroke(parent, color, thickness, transparency)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+	return s
+end
+
+local function gradient(parent, a, b, rotation)
+	local g = Instance.new("UIGradient")
+	g.Color = ColorSequence.new(a, b)
+	g.Rotation = rotation or 0
+	g.Parent = parent
+	return g
+end
+
+local function label(parent, text, size, color, font)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextSize = size
+	l.TextColor3 = color or COLORS.text
+	l.Font = font or Enum.Font.GothamMedium
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = parent
+	return l
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "FollowBotGui"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(300, 420)
+main.Position = UDim2.new(0.5, -150, 0.5, -210)
+main.BackgroundColor3 = COLORS.bg
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+corner(main, 16)
+stroke(main, COLORS.accentA, 1.5, 0.35)
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 48)
+header.BackgroundColor3 = COLORS.accentA
+header.BorderSizePixel = 0
+header.Parent = main
+gradient(header, COLORS.accentA, COLORS.accentB, 20)
+
+local title = label(header, "🤖  Follow Bot", 18, Color3.new(1, 1, 1), Enum.Font.GothamBold)
+title.Size = UDim2.new(1, -90, 1, 0)
+title.Position = UDim2.fromOffset(16, 0)
+
+local function headerButton(text, xOffset)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(28, 28)
+	b.Position = UDim2.new(1, xOffset, 0.5, -14)
+	b.BackgroundColor3 = Color3.new(1, 1, 1)
+	b.BackgroundTransparency = 0.8
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.TextSize = 16
+	b.Font = Enum.Font.GothamBold
+	b.AutoButtonColor = false
+	b.Parent = header
+	corner(b, 8)
+	b.MouseEnter:Connect(function()
+		TweenService:Create(b, TweenInfo.new(0.15), { BackgroundTransparency = 0.55 }):Play()
+	end)
+	b.MouseLeave:Connect(function()
+		TweenService:Create(b, TweenInfo.new(0.15), { BackgroundTransparency = 0.8 }):Play()
+	end)
+	return b
+end
+
+local minBtn = headerButton("–", -70)
+local closeBtn = headerButton("✕", -36)
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.new(1, 0, 1, -48)
+body.Position = UDim2.fromOffset(0, 48)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(1, -24, 0, 34)
+searchBox.Position = UDim2.fromOffset(12, 12)
+searchBox.BackgroundColor3 = COLORS.panel
+searchBox.PlaceholderText = "🔍  Поиск игрока..."
+searchBox.PlaceholderColor3 = COLORS.subtext
+searchBox.Text = ""
+searchBox.TextColor3 = COLORS.text
+searchBox.TextSize = 14
+searchBox.Font = Enum.Font.Gotham
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = body
+corner(searchBox, 10)
+stroke(searchBox, COLORS.accentA, 1, 0.7)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -24, 1, -190)
+list.Position = UDim2.fromOffset(12, 56)
+list.BackgroundColor3 = COLORS.panel
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.ScrollBarImageColor3 = COLORS.accentA
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.CanvasSize = UDim2.new()
+list.Parent = body
+corner(list, 12)
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.SortOrder = Enum.SortOrder.Name
+listLayout.Parent = list
+
+local listPadding = Instance.new("UIPadding")
+listPadding.PaddingTop = UDim.new(0, 6)
+listPadding.PaddingBottom = UDim.new(0, 6)
+listPadding.PaddingLeft = UDim.new(0, 6)
+listPadding.PaddingRight = UDim.new(0, 6)
+listPadding.Parent = list
+
+local targetLabel = label(body, "Цель: не выбрана", 14, COLORS.subtext, Enum.Font.GothamMedium)
+targetLabel.Size = UDim2.new(1, -24, 0, 20)
+targetLabel.Position = UDim2.new(0, 12, 1, -126)
+
+local statusLabel = label(body, "Статус: ожидание", 13, COLORS.subtext, Enum.Font.Gotham)
+statusLabel.Size = UDim2.new(1, -24, 0, 18)
+statusLabel.Position = UDim2.new(0, 12, 1, -104)
+statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+statusCallback = function(text)
+	statusLabel.Text = "Статус: " .. text
+end
+
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.new(1, -24, 0, 46)
+toggle.Position = UDim2.new(0, 12, 1, -78)
+toggle.BackgroundColor3 = COLORS.off
+toggle.Text = "▶  Бежать до цели: ВЫКЛ"
+toggle.TextColor3 = Color3.new(1, 1, 1)
+toggle.TextSize = 16
+toggle.Font = Enum.Font.GothamBold
+toggle.AutoButtonColor = false
+toggle.Parent = body
+corner(toggle, 12)
+stroke(toggle, Color3.new(1, 1, 1), 1, 0.8)
+
+local thumbCache = {}
+
+local function selectPlayer(plr)
+	Bot.Target = plr
+	Bot.Visited = {}
+	Bot.LastDir = nil
+	Bot.NextPathTime = 0
+	targetLabel.Text = "Цель: " .. plr.DisplayName .. " (@" .. plr.Name .. ")"
+	targetLabel.TextColor3 = COLORS.text
+	for _, row in ipairs(list:GetChildren()) do
+		if row:IsA("Frame") then
+			local selected = row.Name == plr.Name
+			TweenService:Create(row, TweenInfo.new(0.2), {
+				BackgroundColor3 = selected and COLORS.rowSelected or COLORS.row,
+			}):Play()
+		end
+	end
+end
+
+local function makeRow(plr)
+	local row = Instance.new("Frame")
+	row.Name = plr.Name
+	row.Size = UDim2.new(1, 0, 0, 48)
+	row.BackgroundColor3 = (Bot.Target == plr) and COLORS.rowSelected or COLORS.row
+	row.BorderSizePixel = 0
+	row.Parent = list
+	corner(row, 10)
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.Size = UDim2.fromOffset(36, 36)
+	avatar.Position = UDim2.fromOffset(6, 6)
+	avatar.BackgroundColor3 = COLORS.bg
+	avatar.BorderSizePixel = 0
+	avatar.Parent = row
+	corner(avatar, 18)
+
+	if thumbCache[plr.UserId] then
+		avatar.Image = thumbCache[plr.UserId]
+	else
+		task.spawn(function()
+			local ok, img = pcall(function()
+				return Players:GetUserThumbnailAsync(
+					plr.UserId,
+					Enum.ThumbnailType.HeadShot,
+					Enum.ThumbnailSize.Size100x100
+				)
+			end)
+			if ok and img then
+				thumbCache[plr.UserId] = img
+				if avatar.Parent then avatar.Image = img end
+			end
+		end)
+	end
+
+	local nameLbl = label(row, plr.DisplayName, 14, COLORS.text, Enum.Font.GothamBold)
+	nameLbl.Size = UDim2.new(1, -60, 0, 20)
+	nameLbl.Position = UDim2.fromOffset(52, 6)
+	nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local userLbl = label(row, "@" .. plr.Name, 12, COLORS.subtext, Enum.Font.Gotham)
+	userLbl.Size = UDim2.new(1, -60, 0, 16)
+	userLbl.Position = UDim2.fromOffset(52, 26)
+	userLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.fromScale(1, 1)
+	btn.BackgroundTransparency = 1
+	btn.Text = ""
+	btn.Parent = row
+	btn.MouseButton1Click:Connect(function()
+		selectPlayer(plr)
+	end)
+	btn.MouseEnter:Connect(function()
+		if Bot.Target ~= plr then
+			TweenService:Create(row, TweenInfo.new(0.15), {
+				BackgroundColor3 = Color3.fromRGB(46, 46, 70),
+			}):Play()
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if Bot.Target ~= plr then
+			TweenService:Create(row, TweenInfo.new(0.15), { BackgroundColor3 = COLORS.row }):Play()
+		end
+	end)
+end
+
+local function refreshList()
+	for _, c in ipairs(list:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	local q = searchBox.Text:lower()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			if q == "" or plr.Name:lower():find(q, 1, true) or plr.DisplayName:lower():find(q, 1, true) then
+				makeRow(plr)
+			end
+		end
+	end
+end
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(refreshList)
+
+Players.PlayerAdded:Connect(refreshList)
+Players.PlayerRemoving:Connect(function(plr)
+	if Bot.Target == plr then
+		Bot.Target = nil
+		targetLabel.Text = "Цель: покинула сервер"
+		targetLabel.TextColor3 = COLORS.subtext
+		if Bot.Running then
+			Bot.Running = false
+			Bot.Token += 1
+			TweenService:Create(toggle, TweenInfo.new(0.25), { BackgroundColor3 = COLORS.off }):Play()
+			toggle.Text = "▶  Бежать до цели: ВЫКЛ"
+			setStatus("цель ушла")
+		end
+	end
+	task.defer(refreshList)
+end)
+
+local function setRunning(state)
+	if state and not Bot.Target then
+		setStatus("сначала выберите игрока")
+		TweenService:Create(toggle, TweenInfo.new(0.1), { Position = UDim2.new(0, 18, 1, -78) }):Play()
+		task.delay(0.1, function()
+			TweenService:Create(toggle, TweenInfo.new(0.1), { Position = UDim2.new(0, 12, 1, -78) }):Play()
+		end)
+		return
+	end
+
+	Bot.Running = state
+	Bot.Token += 1
+	Bot.Stuck = false
+	Bot.Sword = nil
+	Bot.Visited = {}
+	Bot.Steps = 0
+	Bot.LastDir = nil
+	Bot.NextPathTime = 0
+
+	if state then
+		toggle.Text = "■  Бежать до цели: ВКЛ"
+		Twee
